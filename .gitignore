@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Outputs
+outputs/
+sean_src/outputs/
+
+# Debug tensors
+*_debug.pt
+
+# Large binary / data files
+data/tcp/
+pytorch3d/
+
+# Third-party build artifacts
+third_party/GVHMR_realisdance/gvhmr.egg-info/
+third_party/GVHMR_realisdance/inputs/
+third_party/GVHMR_realisdance/outputs/
+third_party/GeoCalib/geocalib.egg-info/
+third_party/depth_pro/__pycache__/
+third_party/depth_pro/network/__pycache__/
