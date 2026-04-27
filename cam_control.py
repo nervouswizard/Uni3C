@@ -2,6 +2,9 @@ import argparse
 import gc
 import os
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "0")
+
 import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKLWan
@@ -29,6 +32,8 @@ if __name__ == '__main__':
     parser.add_argument("--nframe", default=81, type=int, help="Total number of frames")
     parser.add_argument("--fsdp", action="store_true", help="whether to use fsdp to save memory")
     parser.add_argument("--enable_sp", action="store_true", help="whether to use SP inference")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="enable gradient checkpointing (only effective during training)")
+    parser.add_argument("--sequential_offload", action="store_true", help="use sequential cpu offload (lowest VRAM, slowest; for single GPU)")
     parser.add_argument("--prompt", default="This video describes a slow and stable camera movement with high quality and high definition.",
                         type=str, help="Prompt of the reference image")
     parser.add_argument("--max_area", default=480 * 768, type=int, help="Total pixel area of height * width")
@@ -74,6 +79,12 @@ if __name__ == '__main__':
     transformer = PCDController.from_pretrained(base_model_id, subfolder="transformer", controlnet_cfg=cfg.controlnet_cfg, torch_dtype=torch.bfloat16)
     logger.info("loading controlnet...")
     transformer.build_controlnet(model_path="controlnet.pth", logger=logger)
+
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+        transformer.controlnet.gradient_checkpointing = True
+        logger.info("Gradient checkpointing enabled for transformer and controlnet.")
+
     if args.enable_sp:  # replace attention_processor for DiT
         transformer.sp_size = get_sequence_parallel_world_size()
         for layer in transformer.controlnet.controlnet_blocks:
@@ -121,10 +132,19 @@ if __name__ == '__main__':
         scheduler=UniPCMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     )
 
-    # replace this with pipe.to("cuda") if you have sufficient VRAM
-    if not args.enable_sp or not args.fsdp:
-        # pipe.to("cuda")
-        pipe.enable_model_cpu_offload(gpu_id=local_rank, device="cuda")
+    if args.enable_sp and args.fsdp:
+        # FSDP+SP mode: each model already placed by shard_model().
+        # Do NOT call pipe.to(device) — it would gather all FSDP params onto each GPU simultaneously (OOM).
+        # Patch _execution_device so the pipeline creates latents/embeddings on the correct CUDA device.
+        pipe._fsdp_execution_device = device
+        logger.info(f"FSDP+SP mode: pipeline execution device set to {device}.")
+    else:
+        if args.sequential_offload:
+            pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+            logger.info("Sequential CPU offload enabled (low VRAM, slower inference).")
+        else:
+            pipe.enable_model_cpu_offload(gpu_id=local_rank, device="cuda")
+            logger.info("Model CPU offload enabled.")
 
     image, render_video, render_mask, camera_embedding, height, width = load_dataset(
         reference_image=args.reference_image,

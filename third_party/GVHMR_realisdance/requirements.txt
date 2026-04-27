@@ -36,7 +36,7 @@ joblib
 # 3D-Vision
 # no pre-compiled wheel for cu124
 trimesh
-chumpy
+# chumpy
 smplx
 wis3d
 pycolmap

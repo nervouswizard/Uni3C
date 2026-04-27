@@ -127,6 +127,15 @@ def retrieve_latents(
 
 
 class PCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
+    # Allow FSDP mode to override the execution device without calling pipe.to(device).
+    # With FSDP+CPUOffload, all parameters live on CPU, so the default _execution_device
+    # would return "cpu". Set pipe._fsdp_execution_device = torch.device("cuda:N") to fix this.
+    @property
+    def _execution_device(self):
+        if hasattr(self, '_fsdp_execution_device'):
+            return self._fsdp_execution_device
+        return super()._execution_device
+
     r"""
     Pipeline for image-to-video generation using Wan.
 

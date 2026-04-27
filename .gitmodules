@@ -1,0 +1,3 @@
+[submodule "third_party/DiffSynth-Studio"]
+	path = third_party/DiffSynth-Studio
+	url = https://github.com/modelscope/DiffSynth-Studio.git

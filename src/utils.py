@@ -176,6 +176,38 @@ def traj_map(traj_type):
         d_theta = 0.0
         d_phi = -360.0
         d_r = 1.0
+    elif traj_type == "test1":
+        cam_traj = "free"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = 0.0
+        d_phi = 90.0
+        d_r = 1.0
+    elif traj_type == "test_right":
+        cam_traj = "free"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = 0.0
+        d_phi = -90.0
+        d_r = 1.0
+    elif traj_type == "test_up":
+        cam_traj = "free"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = -90.0
+        d_phi = 0.0
+        d_r = 1.0
+    elif traj_type == "test_down":
+        cam_traj = "free"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = 90.0
+        d_phi = 0.0
+        d_r = 1.0
     else:
         raise NotImplementedError
     return cam_traj, x_offset, y_offset, z_offset, d_theta, d_phi, d_r

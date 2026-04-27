@@ -1,12 +1,9 @@
 # Uni3C
+
 [Siggraph Asian 2025] Uni3C: Unifying Precisely 3D-Enhanced Camera and Human Motion Controls for Video Generation
 
-<a href='https://arxiv.org/abs/2504.14899'>
-<img src='https://img.shields.io/badge/Arxiv-red'></a> 
-<a href='https://ewrfcas.github.io/Uni3C/'>
-<img src='https://img.shields.io/badge/Project-page-orange'></a>
-
 ## News
+
 - **2025-08-06**: Bug fixed: using `UniPCMultistepScheduler` instead of `FlowMatchEulerDiscreteScheduler`.
 - **2025-05-30**: We updated codes for unified inference.
 - **2025-05-28**: We updated codes of alignment for human pose and world point clouds.
@@ -15,13 +12,14 @@
 - **2025-05-21**: Release inference code of PCDController.
 
 ## TODO List
-- [x] Camera control inference code
-- [x] Model weights
-- [x] Validation benchmark
-- [x] FSDP + Sequential parallel
-- [x] HumanPose-WorldPointClouds alignment
-- [x] Unified control inference code
-- [ ] Hamer alignment
+
+- Camera control inference code
+- Model weights
+- Validation benchmark
+- FSDP + Sequential parallel
+- HumanPose-WorldPointClouds alignment
+- Unified control inference code
+- Hamer alignment
 
 ## Setup
 
@@ -33,14 +31,17 @@ cd Uni3C
 apt-get update && apt-get install tmux ffmpeg libsm6 libxext6 libglm-dev -y
 conda create -n uni3c python=3.10
 conda activate uni3c
+conda install -c "nvidia/label/cuda-12.4.1" cuda-toolkit
 
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 pip install -r requirements.txt
 pip install carvekit --no-deps
 
 # install pytorch3d
 git clone https://github.com/facebookresearch/pytorch3d.git
-cd pytorch3d && pip install -e .
+cd pytorch3d
+pip install -e . --no-build-isolation
 
 # setup for alignment
 cd third_party/GVHMR_realisdance
@@ -56,21 +57,23 @@ cd ../..
 There are 7 parameters to control the camera freely.
 
 Rotation parameters:
+
 - `d_r`: Distance from the camera to the foreground center, default is 1.0, range 0.25 to 2.5.
 - `d_theta`: Rotated elevation degrees, <0 up, >0 down, range -90 to 30.
 - `d_phi`: Rotated azimuth degrees, <0 right, >0 left, supports 360 degrees; range -360 to 360.
 
 Offset parameters:
+
 - `x_offset`: Horizontal translation, <0 left, >0 right, range -0.5 to 0.5; depends on depth.
 - `y_offset`: Vertical translation, <0 up, >0 down, range -0.5 to 0.5; depends on depth.
 - `z_offset`: Forward and backward translation, <0 back, >0 forward, range -0.5 to 0.5 is ok; depends on depth.
 
 Intrinsic parameters:
+
 - `focal_length`: Focal length, range 0.25 to 2.5; changing focal length zooms in and out.
 
 We also support `traj_type` to define camera trajectories: `"custom", "free1", "free2", "free3", "free4", "free5", "swing1", "swing2", "orbit"`.
 `"custom"` is used to control along a custom trajectory with parameters mentioned above, while others support for pre-defined camera trajectories.
-
 
 We recommend to read [ViewCrafter](https://github.com/Drexubery/ViewCrafter/blob/main/docs/gradio_tutorial.md) for more detailed hyper-parameter introduction about the camera control
 
@@ -116,16 +119,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 cam_control.py \
 
 You should achieve results as below:
 
-| Reference                                     | Render (stage1)                         | Result (stage2)                         |
-|-----------------------------------------------|-----------------------------------------|-----------------------------------------|
-| ![Reference IMG](./data/assets/reference.jpg) | ![Render GIF](./data/assets/render.gif) | ![Result GIF](./data/assets/result.gif) |
+
+| Reference     | Render (stage1) | Result (stage2) |
+| ------------- | --------------- | --------------- |
+| Reference IMG | Render GIF      | Result GIF      |
+
 
 ### Efficiency comparison
+
+
 | Methods                       | GPU memory (GB) | Time (min) |
-|-------------------------------|-----------------|------------|
+| ----------------------------- | --------------- | ---------- |
 | H20*1 + offload               | 50.8*1          | ~20.0      |
 | H20*4 + SP + offload          | 53.7*4          | ~15.0      |
 | H20*4 + SP + FSDP (recommend) | 46.1*4          | <5.0       |
+
 
 ## Human pose & Alignment & Unified control
 
@@ -167,15 +175,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 uni3c_inference.py \
 
 You should achieve results as below:
 
-| Reference image                                | Target video                                     | Aligned video                                     | Uni3C result                                  |
-|------------------------------------------------|--------------------------------------------------|---------------------------------------------------|-----------------------------------------------|
-| ![Reference IMG](./data/assets/reference2.jpg) | ![Target video GIF](./data/assets/tar_video.gif) | ![Aligned video GIF](./data/assets/res_video.gif) | ![Final video GIF](./data/assets/result2.gif) |
+
+| Reference image | Target video     | Aligned video     | Uni3C result    |
+| --------------- | ---------------- | ----------------- | --------------- |
+| Reference IMG   | Target video GIF | Aligned video GIF | Final video GIF |
+
 
 ## Benchmark
 
 You could download validation images and prompts from this [link](https://huggingface.co/datasets/ewrfcas/Uni3C).
 
 ## Cite
+
 If you found our project helpful, please consider citing:
 
 ```
@@ -187,4 +198,5 @@ If you found our project helpful, please consider citing:
 ```
 
 ## Acknowledgements
+
 Our codes are built upon [RealisDance-DiT](https://github.com/damo-cv/RealisDance), [Depth-Pro](https://github.com/apple/ml-depth-pro), [ViewCrafter](https://github.com/Drexubery/ViewCrafter), [GVHMR](https://github.com/zju3dv/GVHMR), [GeoCalib](https://github.com/cvg/GeoCalib), [Wan2.1](https://github.com/Wan-Video/Wan2.1) and [diffusers](https://github.com/huggingface/diffusers).

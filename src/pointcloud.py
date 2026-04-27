@@ -74,7 +74,7 @@ def suppress_stdout_stderr():
 
 def point_rendering(K, w2cs, depth, image, raster_settings, device,
                     background_color=[0, 0, 0], sobel_threshold=0.35, contract=8.0,
-                    sam_mask=None):
+                    sam_mask=None, custom_points=None, custom_colors=None):
     """
     only support batchsize=1
     :param K: [F,3,3]
@@ -100,26 +100,31 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
         render_rgbs = torch.zeros((nframe, 3, h, w), device=device, dtype=torch.float32)
         render_masks = torch.ones((nframe, 1, h, w), device=device, dtype=torch.float32)
     else:
-        mid_depth = torch.median(depth.reshape(-1), dim=0)[0] * contract
-        depth[depth > mid_depth] = ((2 * mid_depth) - (mid_depth ** 2 / (depth[depth > mid_depth] + 1e-6)))
+        if custom_points is not None and custom_colors is not None:
+            points_3d = custom_points
+            colors = custom_colors
+            boundary_mask = torch.zeros((points_3d.shape[0],), device=device, dtype=torch.bool)
+        else:
+            mid_depth = torch.median(depth.reshape(-1), dim=0)[0] * contract
+            depth[depth > mid_depth] = ((2 * mid_depth) - (mid_depth ** 2 / (depth[depth > mid_depth] + 1e-6)))
 
-        point_depth = einops.rearrange(depth[0], "c h w -> (h w) c")
-        disp = 1 / (depth + 1e-7)
-        boundary_mask = get_boundaries_mask(disp, sobel_threshold=sobel_threshold)
+            point_depth = einops.rearrange(depth[0], "c h w -> (h w) c")
+            disp = 1 / (depth + 1e-7)
+            boundary_mask = get_boundaries_mask(disp, sobel_threshold=sobel_threshold)
 
-        x = torch.arange(w).float() + 0.5
-        y = torch.arange(h).float() + 0.5
-        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1).to(device)
-        points = einops.rearrange(points, "w h c -> (h w) c")
-        # GPU求逆有错
-        points_3d = (c2ws[0] @ points_padding((K[0].cpu().inverse().to(device) @ points_padding(points).T).T * point_depth).T).T[:, :3]
+            x = torch.arange(w).float() + 0.5
+            y = torch.arange(h).float() + 0.5
+            points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1).to(device)
+            points = einops.rearrange(points, "w h c -> (h w) c")
+            # GPU求逆有错
+            points_3d = (c2ws[0] @ points_padding((K[0].cpu().inverse().to(device) @ points_padding(points).T).T * point_depth).T).T[:, :3]
 
-        colors = einops.rearrange(image[0], "c h w -> (h w) c")
+            colors = einops.rearrange(image[0], "c h w -> (h w) c")
 
-        boundary_mask = boundary_mask.reshape(-1)
-        if sam_mask is not None:
-            sam_mask = sam_mask.reshape(-1)
-            boundary_mask[sam_mask == True] = True
+            boundary_mask = boundary_mask.reshape(-1)
+            if sam_mask is not None:
+                sam_mask = sam_mask.reshape(-1)
+                boundary_mask[sam_mask == True] = True
 
         points_3d = points_3d[boundary_mask == False]
 
@@ -153,6 +158,7 @@ def point_rendering(K, w2cs, depth, image, raster_settings, device,
 
         try:
             with suppress_stdout_stderr():
+                print("Rendering pointcloud...")
                 render_rgbs, zbuf = renderer(point_cloud)  # rgb:[f,h,w,3]
         except Exception as e:
             print(f"Error: {e}")

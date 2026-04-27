@@ -12,15 +12,22 @@ def shard_model(
         model,
         device_id,
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
+        reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
         process_group=None,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        sync_module_states=True,
+        sync_module_states=False,
         use_orig_params=False,  # this should only be "True" for inference
         model_type="wan"
 ):
-    model = model.to(torch.float32)
+    # FSDP requires uniform dtype across all parameters within a flattened unit.
+    # ControlNet weights (loaded from controlnet.pth) may be float32 while the base
+    # transformer is bfloat16. Cast in-place to avoid the ValueError and memory spike
+    # that would occur from model.to(float32).
+    for param in model.parameters():
+        if param.dtype != param_dtype:
+            param.data = param.data.to(param_dtype)
+
     if model_type == "wan":
         block_list = list(model.blocks)
         if hasattr(model, "controlnet") and hasattr(model.controlnet, "controlnet_blocks"):

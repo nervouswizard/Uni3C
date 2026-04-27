@@ -29,15 +29,15 @@ def main():
                         help="the path of input image")
     parser.add_argument("--output_path", default="outputs/temp", type=str,
                         help="output folder's path")
-    parser.add_argument("--traj_type", default="custom", type=str,
-                        choices=["custom", "free1", "free2", "free3", "free4", "free5", "swing1", "swing2", "orbit"],
+    parser.add_argument("--traj_type", default="custom_frame9", type=str,
+                        choices=["custom", "custom_frame9", "free1", "free2", "free3", "free4", "free5", "swing1", "swing2", "orbit", "test1", "test_right", "test_up", "test_down"],
                         help="custom refers to a custom trajectory, while the others are pre-defined camera trajectories (see traj_map for details)")
     parser.add_argument("--nframe", default=81, type=int, help="Total number of frames")
-    parser.add_argument("--d_r", default=1.0, type=float,
+    parser.add_argument("--d_r", default=2.0, type=float,
                         help="Camera distance, default is 1.0, range 0.25 to 2.5")
     parser.add_argument("--d_theta", default=0.0, type=float,
                         help="Vertical rotation, <0 up, >0 down, range -90 to 30; generally not recommended to angle too much downwards")
-    parser.add_argument("--d_phi", default=0.0, type=float,
+    parser.add_argument("--d_phi", default=180.0, type=float,
                         help="Horizontal rotation, <0 right, >0 left, supports 360 degrees; range -360 to 360")
     parser.add_argument("--x_offset", default=0.0, type=float,
                         help="Horizontal translation, <0 left, >0 right, range -0.5 to 0.5; depends on depth, excessive movement may cause artifacts")
@@ -49,6 +49,8 @@ def main():
                         help="Focal length, range 0.25 to 2.5; changing focal length zooms in and out")
     parser.add_argument("--start_elevation", default=5.0, type=float,
                         help="Initial angle, no exceptions to change")
+    parser.add_argument("--input_pcd", default=None, type=str,
+                        help="Optional custom point cloud (.ply) path")
 
     args = parser.parse_args()
     device = "cuda"
@@ -61,7 +63,7 @@ def main():
                                 model_path=hf_hub_download(repo_id="Carve/tracer_b7", filename="tracer_b7.pth")).eval()
 
     # == motion definition ==
-    if args.traj_type == "custom":
+    if args.traj_type == "custom" or args.traj_type == "custom_frame9":
         cam_traj, x_offset, y_offset, z_offset, d_theta, d_phi, d_r = \
             "free", args.x_offset, args.y_offset, args.z_offset, args.d_theta, args.d_phi, args.d_r
     else:
@@ -71,12 +73,19 @@ def main():
     image = Image.open(args.reference_image).convert("RGB")
     image = ImageOps.exif_transpose(image)
     w_origin, h_origin = image.size
-    hw_list = [[480, 768], [512, 720], [608, 608], [720, 512], [768, 480]]
-    hw_ratio_list = [h_ / w_ for [h_, w_] in hw_list]
-    hw_ratio = h_origin / w_origin
-    sub_hw_ratio = np.abs(np.array(hw_ratio_list) - hw_ratio)
-    select_idx = np.argmin(sub_hw_ratio)
-    height, width = hw_list[select_idx]
+    # 不使用預設的解析度列表，改為直接將原圖等比例縮放到大約 512 的基準高度/寬度
+    base_res = 512
+    if w_origin > h_origin:
+        width = int(base_res * (w_origin / h_origin))
+        height = base_res
+    else:
+        width = base_res
+        height = int(base_res * (h_origin / w_origin))
+        
+    # 確保高寬能被 16 整除 (避免 FFmpeg macro_block_size 警告並確保影片相容性)
+    width = (width // 16) * 16
+    height = (height // 16) * 16
+    
     print(f"Image: {args.reference_image.split('/')[-1]}, Resolution: {h_origin}x{w_origin}->{height}x{width}")
     image = image.resize((width, height), Image.Resampling.BICUBIC)
     validation_image = ToTensor()(image)[None]  # [1,c,h,w], 0~1
@@ -141,6 +150,133 @@ def main():
                                           y_offset=y_offset,
                                           z_offset=z_offset)
 
+    # === 讀取自訂點雲 ===
+    custom_points = None
+    custom_colors = None
+    if args.input_pcd is not None:
+        print(f"Loading custom point cloud from {args.input_pcd}")
+        custom_pcd = trimesh.load(args.input_pcd)
+        custom_points = torch.tensor(custom_pcd.vertices, dtype=torch.float32).to(device)
+        # ========== 保持自訂點雲原樣，改為根據點雲計算相機參數 ==========
+        
+        # 由於此檔案的影像輸入值域為 [-1, 1]，我們需將 0~255 的點雲顏色正規化為 [-1, 1]
+        custom_colors = np.array(custom_pcd.colors[:, :3])
+        custom_colors = torch.tensor(custom_colors, dtype=torch.float32).to(device) / 255.0 * 2.0 - 1.0
+
+        # 將自訂點雲的座標系轉換為 PyTorch3D 相機座標 (X向左, Y向上, Z向前) 以符合原始腳本邏輯
+        # 我們假設點雲原本是 OpenGL 座標系 (Z向螢幕內，因此大部分為負值)
+        # 由於您發現圖片上下顛倒，因此我們除了調整 Z 軸，也反轉 Y 軸
+        if custom_points[:, 2].mean() < -0.2:
+            custom_points[:, 2] = -custom_points[:, 2]  # Z 軸反轉
+            custom_points[:, 1] = -custom_points[:, 1]  # Y 軸反轉 (修正上下顛倒)
+            
+        # ====== 修正點雲的長寬比例以符合原圖 ======
+        # 計算目前點雲的長寬範圍
+        min_pt = custom_points.min(dim=0)[0]
+        max_pt = custom_points.max(dim=0)[0]
+        cur_w = (max_pt[0] - min_pt[0]).item()
+        cur_h = (max_pt[1] - min_pt[1]).item()
+        
+        if cur_h > 0:
+            cur_aspect = cur_w / cur_h
+            target_aspect = width / height
+            
+            # 如果目前比例跟目標比例差太多 (例如本來是 1:1 但原圖是 16:9)
+            if abs(cur_aspect - target_aspect) > 0.05:
+                if cur_aspect < target_aspect:
+                    # 點雲太窄，需要拉長 X 軸
+                    scale_x = target_aspect / cur_aspect
+                    custom_points[:, 0] *= scale_x
+                    print(f"調整點雲形狀: X 軸拉伸 {scale_x:.2f} 倍以符合原圖 {width}x{height} 的比例")
+                else:
+                    # 點雲太扁，需要拉長 Y 軸
+                    scale_y = cur_aspect / target_aspect
+                    custom_points[:, 1] *= scale_y
+                    print(f"調整點雲形狀: Y 軸拉伸 {scale_y:.2f} 倍以符合原圖 {width}x{height} 的比例")
+
+        # 重新計算因為可能被縮放過的長寬
+        min_pt_new = custom_points.min(dim=0)[0]
+        max_pt_new = custom_points.max(dim=0)[0]
+        cur_w_new = (max_pt_new[0] - min_pt_new[0]).item()
+        cur_h_new = (max_pt_new[1] - min_pt_new[1]).item()
+        
+        center_custom = custom_points.mean(dim=0).cpu()
+        
+        # 為了讓點雲投影到畫面上剛好符合第一幀原圖的大小
+        # 相似三角形公式: 投影高度 = (3D高度 / 相機距離) * 焦距
+        # 因此，為了讓投影高度 == 視窗高度 (height)，我們這樣反推距離：
+        if cur_h_new > 0 and height > 0:
+            new_radius = (cur_h_new * focallength_px) / height
+        else:
+            scale_custom = torch.max(custom_points.max(dim=0)[0] - custom_points.min(dim=0)[0]).item()
+            new_radius = scale_custom * 1.5 if scale_custom > 0 else 1.5
+            
+        depth_avg = new_radius
+        
+        print(f"自訂點雲中心: {center_custom.numpy()}, 實際大小: {cur_w_new:.3f}x{cur_h_new:.3f}, 自動調整相機距離: {new_radius:.3f}")
+        
+        # 設定新的世界中心點與相機位置 c2w_0
+        # 因為已經把點雲調整成適合的 Z 軸方向，我們就把相機放在點雲的正前方
+        c2w_0_custom = torch.tensor([
+            [1.0, 0.0, 0.0, center_custom[0].item()],
+            [0.0, 1.0, 0.0, center_custom[1].item()],
+            [0.0, 0.0, 1.0, center_custom[2].item() - new_radius], # 相機位置在 Z軸退後
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=torch.float32)
+        
+        # 第一幀如果想要給定一點初始仰角
+        # 注意: 這裡已經不再顛倒 Y 軸，所以仰角旋轉方向可能也需要微調
+        elevation_rad = np.deg2rad(args.start_elevation)
+        R_elevation = torch.tensor([
+            [1, 0, 0, 0],
+            [0, np.cos(elevation_rad), -np.sin(elevation_rad), 0],
+            [0, np.sin(elevation_rad), np.cos(elevation_rad), 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32)
+        
+        # 將仰角加入，計算繞著原點 (0,0,0) 的初始相機位置
+        c2w_0_origin = R_elevation @ torch.tensor([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, -new_radius],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32)
+        
+        # 產生真正的初始相機 (平移到自訂點雲中心)
+        c2w_0 = c2w_0_origin.clone()
+        c2w_0[:3, -1] += center_custom
+        w2c_0 = c2w_0.inverse()
+        
+        # 重新生成相機軌跡
+        # 由於原本的 build_cameras 假設相機圍繞 [0, 0, 0] 旋轉
+        # 我們為了支援預設所有的複雜軌跡(如 swing)，改為直接呼叫 build_cameras
+        # 但我們餵給它的是「繞著原點」的初始相機 c2w_0_origin
+        w2cs_base, c2ws_base, intrinsic = build_cameras(cam_traj=cam_traj,
+                                                        w2c_0=c2w_0_origin.inverse(),
+                                                        c2w_0=c2w_0_origin,
+                                                        intrinsic=intrinsic,
+                                                        nframe=args.nframe,
+                                                        focal_length=args.focal_length,
+                                                        d_theta=d_theta,
+                                                        d_phi=d_phi,
+                                                        d_r=d_r,
+                                                        radius=new_radius,
+                                                        x_offset=x_offset,
+                                                        y_offset=y_offset,
+                                                        z_offset=z_offset)
+
+        # 所有的相機軌跡算完後，統一平移到 center_custom 的位置，才能對齊真正的點雲中心
+        w2cs_list_new = []
+        c2ws_list_new = []
+        for i in range(args.nframe):
+            c2w_i = c2ws_base[i].clone()
+            c2w_i[:3, -1] += center_custom
+            w2cs_list_new.append(c2w_i.inverse())
+            c2ws_list_new.append(c2w_i)
+            
+        w2cs = torch.stack(w2cs_list_new, dim=0)
+        c2ws = torch.stack(c2ws_list_new, dim=0)
+
     # save camera infos
     w2cs_list = w2cs.cpu().numpy().tolist()
     camera_infos = {"intrinsic": K.cpu().numpy().tolist(), "extrinsic": w2cs_list, "height": height, "width": width}
@@ -158,7 +294,9 @@ def main():
                                                      device=device,
                                                      background_color=[0, 0, 0],
                                                      sobel_threshold=0.35,
-                                                     sam_mask=None)
+                                                     sam_mask=None,
+                                                     custom_points=custom_points,
+                                                     custom_colors=custom_colors)
 
     control_imgs = einops.rearrange(control_imgs, "(b f) c h w -> b c f h w", f=args.nframe)
     render_masks = einops.rearrange(render_masks, "(b f) c h w -> b c f h w", f=args.nframe)
