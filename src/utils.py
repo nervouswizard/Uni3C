@@ -176,7 +176,7 @@ def traj_map(traj_type):
         d_theta = 0.0
         d_phi = -360.0
         d_r = 1.0
-    elif traj_type == "test1":
+    elif traj_type == "test_left":
         cam_traj = "free"
         x_offset = 0.0
         y_offset = 0.0
