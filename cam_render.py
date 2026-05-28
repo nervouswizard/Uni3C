@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--output_path", default="outputs/temp", type=str,
                         help="output folder's path")
     parser.add_argument("--traj_type", default="custom_frame9", type=str,
-                        choices=["custom", "custom_frame9", "free1", "free2", "free3", "free4", "free5", "swing1", "swing2", "orbit", "test_left", "test_right", "test_up", "test_down"],
+                        choices=["custom", "custom_frame9", "free1", "free2", "free3", "free4", "free5", "swing1", "swing2", "orbit", "test_left", "test_right", "test_up", "test_down", "tour", "tour2"],
                         help="custom refers to a custom trajectory, while the others are pre-defined camera trajectories (see traj_map for details)")
     parser.add_argument("--nframe", default=81, type=int, help="Total number of frames")
     parser.add_argument("--d_r", default=2.0, type=float,

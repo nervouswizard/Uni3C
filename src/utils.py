@@ -208,6 +208,22 @@ def traj_map(traj_type):
         d_theta = 90.0
         d_phi = 0.0
         d_r = 1.0
+    elif traj_type == "tour":
+        cam_traj = "tour"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = 0.0
+        d_phi = 0.0
+        d_r = 1.0
+    elif traj_type == "tour2":
+        cam_traj = "tour2"
+        x_offset = 0.0
+        y_offset = 0.0
+        z_offset = 0.0
+        d_theta = 0.0
+        d_phi = 0.0
+        d_r = 1.0
     else:
         raise NotImplementedError
     return cam_traj, x_offset, y_offset, z_offset, d_theta, d_phi, d_r
@@ -273,6 +289,37 @@ def build_cameras(cam_traj, w2c_0, c2w_0, intrinsic, nframe, focal_length,
         d_thetas[-1] = thetas__[-1]
         d_rs = txt_interpolation(rs__, nframe, mode='smooth')
         d_rs = 1.0 + d_rs
+    elif cam_traj == "tour":
+        # Four sequential sweeps: left → right → up → down, each returning to centre.
+        # Each phase uses a sine curve so motion eases in/out at both ends.
+        N = nframe - 1
+        phase = N // 4
+        t = np.linspace(0, np.pi, phase)      # per-phase angle parameter
+        remaining = N - 3 * phase              # phase 4 absorbs any remainder
+
+        ph_phi   = 90.0  * np.sin(t)          # left  (phi > 0 pans camera left)
+        ph_phi_r = -90.0 * np.sin(t)          # right
+        ph_up    = -90.0 * np.sin(t)          # up    (theta < 0 tilts camera up)
+        ph_dn    = 90.0  * np.sin(np.linspace(0, np.pi, remaining))  # down
+
+        d_phis   = list(np.concatenate([ph_phi, ph_phi_r,
+                                        np.zeros(phase), np.zeros(remaining)]))
+        d_thetas = list(np.concatenate([np.zeros(phase), np.zeros(phase),
+                                        ph_up, ph_dn]))
+        d_rs     = [1.0] * N
+    elif cam_traj == "tour2":
+        # 2.5D parallax: elliptical orbit in angle space (O-shaped path).
+        # phi   = 15·sin(t)   horizontal ±15°
+        # theta = -5·cos(t)   vertical   ±5°  (90° phase offset → true ellipse)
+        # The 90° offset between sin and cos draws a closed ellipse in
+        # (phi, theta) space, giving smooth simultaneous horizontal + vertical
+        # parallax with no repeated direction.  N equally-spaced points cover
+        # one full orbit [0, 2π) so the last frame connects back to the first.
+        N = nframe - 1
+        t = np.linspace(0, 2 * np.pi, N, endpoint=False)  # [0, 2π), uniform orbit
+        d_phis   = list( 15.0 * np.sin(t))   # horizontal ±15°
+        d_thetas = list( -15.0 * np.cos(t))   # vertical   ±15°, 90° ahead of phi
+        d_rs     = [1.0] * N
     else:
         raise NotImplementedError("Unknown trajectory type...")
 
