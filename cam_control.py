@@ -36,6 +36,7 @@ if __name__ == '__main__':
     parser.add_argument("--sequential_offload", action="store_true", help="use sequential cpu offload (lowest VRAM, slowest; for single GPU)")
     parser.add_argument("--prompt", default="This video describes a slow and stable camera movement with high quality and high definition.",
                         type=str, help="Prompt of the reference image")
+    parser.add_argument("--negative_prompt", default="", type=str, help="Negative prompt to avoid unwanted content")
     parser.add_argument("--max_area", default=480 * 768, type=int, help="Total pixel area of height * width")
     parser.add_argument("--seed", default=1024, type=int, help="random seed")
     args = parser.parse_args()
@@ -166,7 +167,7 @@ if __name__ == '__main__':
         render_mask=render_mask.to(device),
         camera_embedding=camera_embedding.to(device),
         prompt=(args.prompt),
-        negative_prompt="",
+        negative_prompt=args.negative_prompt,
         height=height,
         width=width,
         num_frames=args.nframe,
