@@ -39,6 +39,10 @@ if __name__ == '__main__':
     parser.add_argument("--negative_prompt", default="", type=str, help="Negative prompt to avoid unwanted content")
     parser.add_argument("--max_area", default=480 * 768, type=int, help="Total pixel area of height * width")
     parser.add_argument("--seed", default=1024, type=int, help="random seed")
+    parser.add_argument("--inpaint_mode", action="store_true",
+                        help="Extend backbone input with render_latent+render_mask for hole-filling (requires fine-tuned checkpoint)")
+    parser.add_argument("--inpaint_checkpoint", default=None, type=str,
+                        help="Path to fine-tuned patch_embedding checkpoint (.pth) for inpaint mode")
     args = parser.parse_args()
 
     rank = int(os.getenv("RANK", 0))
@@ -80,6 +84,10 @@ if __name__ == '__main__':
     transformer = PCDController.from_pretrained(base_model_id, subfolder="transformer", controlnet_cfg=cfg.controlnet_cfg, torch_dtype=torch.bfloat16)
     logger.info("loading controlnet...")
     transformer.build_controlnet(model_path="controlnet.pth", logger=logger)
+
+    if args.inpaint_mode:
+        logger.info("building inpaint embedding (extended patch_embedding)...")
+        transformer.build_inpaint_embedding(checkpoint_path=args.inpaint_checkpoint)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()

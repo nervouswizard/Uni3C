@@ -87,6 +87,51 @@ class PCDController(WanTransformer3DModel):
         self.rope_max_seq_len = rope_max_seq_len
         self.sp_size = 1
 
+    def build_inpaint_embedding(self, checkpoint_path=None):
+        """Extend patch_embedding to accept render_latent+render_mask_latent as extra channels.
+
+        Adds 17 channels (16 render_latent + 1 render_mask) to the existing patch_embedding.
+        New weights are zero-initialized so the model is identical to the original before training.
+        Only self.patch_embedding needs to be fine-tuned.
+        """
+        old_pe = self.patch_embedding
+        in_ch_new = old_pe.in_channels + 17  # +16 render_latent, +1 render_mask_latent
+
+        orig_dtype = old_pe.weight.dtype
+        new_pe = nn.Conv3d(
+            in_ch_new,
+            old_pe.out_channels,
+            kernel_size=old_pe.kernel_size,
+            stride=old_pe.stride,
+            padding=old_pe.padding,
+            bias=old_pe.bias is not None,
+        ).to(orig_dtype)
+        with torch.no_grad():
+            new_pe.weight.zero_()
+            new_pe.weight[:, :old_pe.in_channels].copy_(old_pe.weight)
+            if old_pe.bias is not None:
+                new_pe.bias.copy_(old_pe.bias)
+
+        self.patch_embedding = new_pe
+        self._inpaint_mode = True
+
+        if checkpoint_path is not None:
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+            self.patch_embedding.load_state_dict(ckpt)
+            print(f"Loaded inpaint checkpoint: {checkpoint_path}")
+
+    def save_inpaint_embedding(self, path):
+        """Save only patch_embedding weights (the fine-tuned part)."""
+        torch.save(self.patch_embedding.state_dict(), path)
+
+    def freeze_except_inpaint(self):
+        """Freeze every parameter except patch_embedding. Reports trainable param count."""
+        for name, param in self.named_parameters():
+            param.requires_grad = "patch_embedding" in name and "_inpaint_mode" not in name
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"Trainable: {trainable:,} / {total:,} params ({100*trainable/total:.3f}%)")
+
     def build_controlnet(self, model_path, logger=None):
         # controlnet
         self.controlnet_patch_embedding = nn.Conv3d(
@@ -147,21 +192,35 @@ class PCDController(WanTransformer3DModel):
         post_patch_width = width // p_w
 
         ### process controlnet inputs ###
+        _render_latent_orig = render_latent  # save before controlnet modification
         render_latent = torch.cat([hidden_states[:, :20], render_latent], dim=1)
         controlnet_rotary_emb = self.controlnet_rope(render_latent)
         controlnet_inputs = self.controlnet_patch_embedding(render_latent)
         controlnet_inputs = controlnet_inputs.flatten(2).transpose(1, 2)
 
-        # additional inputs (mask, camera embedding)
+        # Cast inputs to match controlnet_mask_embedding's own dtype
+        # (float32 at inference, bfloat16 after training-time cast)
+        _mask_dtype = next(self.controlnet_mask_embedding.parameters()).dtype
         if camera_embedding is not None:
-            add_inputs = torch.cat([render_mask, camera_embedding], dim=1)
+            add_inputs = torch.cat([render_mask.to(_mask_dtype), camera_embedding.to(_mask_dtype)], dim=1)
         else:
-            add_inputs = render_mask
+            add_inputs = render_mask.to(_mask_dtype)
         add_inputs = self.controlnet_mask_embedding(add_inputs)
         controlnet_inputs = controlnet_inputs + add_inputs
         ### process controlnet inputs over ###
 
         rotary_emb = self.rope(hidden_states)
+
+        # Inpaint mode: concat render_latent + render_mask_latent to backbone input
+        if getattr(self, '_inpaint_mode', False):
+            _rml = F.interpolate(
+                render_mask.float(),
+                size=hidden_states.shape[-3:],
+                mode='nearest',
+            ).to(hidden_states.dtype)
+            hidden_states = torch.cat(
+                [hidden_states, _render_latent_orig.to(hidden_states.dtype), _rml], dim=1
+            )
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -198,15 +257,15 @@ class PCDController(WanTransformer3DModel):
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
-                # adding control features
+                # adding control features (move to current device for multi-GPU dispatch)
                 if i < len(controlnet_states):
-                    hidden_states += controlnet_states[i]
+                    hidden_states += controlnet_states[i].to(hidden_states.device)
         else:
             for i, block in enumerate(self.blocks):
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-                # adding control features
+                # adding control features (move to current device for multi-GPU dispatch)
                 if i < len(controlnet_states):
-                    hidden_states += controlnet_states[i]
+                    hidden_states += controlnet_states[i].to(hidden_states.device)
 
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)

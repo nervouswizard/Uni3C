@@ -22,13 +22,27 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 # 模式 A：單 GPU + Sequential CPU Offload（最穩定，速度較慢）
 # 建議先用此模式確認程式可以正常執行
 # ==========================================
-CUDA_VISIBLE_DEVICES=2 systemd-run --user --scope -p MemoryMax=2G python cam_control.py \
-    --reference_image "data/tcp/human.png" \
-    --render_path "outputs/tcp/0406/human_down" \
-    --output_path "outputs/tcp/0406/human_down/result.mp4" \
-    --prompt "The video features a human." \
+# CUDA_VISIBLE_DEVICES=3 systemd-run --user --scope -p MemoryMax=2G python cam_control.py \
+#     --reference_image "data/tcp/input_image/human.png" \
+#     --render_path "outputs/tcp/0529/human/right" \
+#     --output_path "outputs/tcp/0529/human/right/result.mp4" \
+#     --prompt "The video features a real human." \
+#     --max_area 258048 \
+#     --sequential_offload
+
+# ==========================================
+# 模式 A-FT：單 GPU + Sequential CPU Offload + Inpaint Fine-tuned 模型
+# 使用訓練好的 patch_embedding checkpoint，改善點雲破洞填補效果
+# ==========================================
+CUDA_VISIBLE_DEVICES=1 systemd-run --user --scope -p MemoryMax=2G conda run -n sean-uni3c-diffsynth python cam_control.py \
+    --reference_image "data/tcp/input_image/human.png" \
+    --render_path "outputs/tcp/0529/human/left" \
+    --output_path "outputs/tcp/0529/human/left/result_inpaint.mp4" \
+    --prompt "The video features a real human." \
     --max_area 258048 \
-    --sequential_offload
+    --sequential_offload \
+    --inpaint_mode \
+    --inpaint_checkpoint "checkpoints/inpaint/inpaint_emb_step00200.pth"
 
 # ==========================================
 # 模式 B：3 GPU + FSDP + SP（速度較快，需確認電源充足）
