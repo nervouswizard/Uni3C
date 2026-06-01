@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import PIL
 import regex as re
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -748,6 +749,289 @@ class PCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             video = latents
 
         # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (video,)
+
+        return WanPipelineOutput(frames=video)
+
+    def _downsample_mask_to_latent(self, render_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Downsample pixel-space render_mask to latent space.
+
+        render_mask : [B, 1, F, H, W]  float {0, 1}
+        returns     : [B, 1, F_lat, h, w]  bool
+          where F_lat = (F-1) // vae_scale_factor_temporal + 1
+                h = H // vae_scale_factor_spatial
+                w = W // vae_scale_factor_spatial
+        """
+        B, _, nF, H, W = render_mask.shape
+        sf = self.vae_scale_factor_spatial    # typically 8
+        tf = self.vae_scale_factor_temporal   # typically 4
+
+        # Spatial: max-pool to latent H/W (any pixel with PCD keeps the region valid)
+        rm = render_mask.view(B * nF, 1, H, W).float()
+        rm = F.max_pool2d(rm, kernel_size=sf, stride=sf)  # [B*F, 1, h, w]
+        h, w = rm.shape[-2], rm.shape[-1]
+        rm = rm.view(B, 1, nF, h, w)
+
+        # Temporal: max over each group of tf pixel-frames → one latent frame
+        F_lat = (nF - 1) // tf + 1
+        rm_lat = rm.new_zeros(B, 1, F_lat, h, w)
+        for j in range(F_lat):
+            start = j * tf
+            end = min(start + tf, nF)
+            rm_lat[:, :, j] = rm[:, :, start:end].max(dim=2).values
+
+        return rm_lat > 0.5  # bool
+
+    def call_with_pcd_completion(
+        self,
+        image: PipelineImageInput,
+        render_video: torch.Tensor,
+        render_mask: torch.Tensor,
+        camera_embedding: torch.Tensor = None,
+        prompt: Union[str, List[str]] = None,
+        negative_prompt: Union[str, List[str]] = None,
+        height: int = 480,
+        width: int = 768,
+        num_frames: int = 81,
+        num_inference_steps: int = 40,
+        guidance_scale: float = 5.0,
+        pcd_guidance_scale: float = 1.0,
+        latent_lr: float = 0.02,
+        num_videos_per_prompt: Optional[int] = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        image_embeds: Optional[torch.Tensor] = None,
+        output_type: Optional[str] = "np",
+        return_dict: bool = True,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        max_sequence_length: int = 512,
+    ):
+        """
+        Point-cloud completion variant of the pipeline.
+
+        Applies Marigold-DC-style test-time optimization so that the
+        denoised video is constrained to match `render_video` wherever
+        `render_mask == 1` (visible point-cloud regions), while the
+        diffusion prior freely inpaints the holes (`render_mask == 0`).
+
+        Additional args vs __call__:
+            pcd_guidance_scale : weight on the point-cloud L1+L2 loss
+            latent_lr          : Adam learning-rate for latent optimization
+        """
+        if num_frames % self.vae_scale_factor_temporal != 1:
+            num_frames = (
+                num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            )
+        num_frames = max(num_frames, 1)
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        device = self._execution_device
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        # ── Step 3: encode prompts ───────────────────────────────────
+        with torch.no_grad():
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                num_videos_per_prompt=num_videos_per_prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+
+        transformer_dtype = self.transformer.dtype
+        prompt_embeds = prompt_embeds.to(transformer_dtype)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
+
+        with torch.no_grad():
+            if image_embeds is None:
+                image_embeds = self.encode_image(image, device)
+            image_embeds = image_embeds.repeat(batch_size, 1, 1).to(transformer_dtype)
+
+        # ── Step 4: timesteps ────────────────────────────────────────
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # ── Step 5: latents ──────────────────────────────────────────
+        num_channels_latents = self.vae.config.z_dim
+        image_tensor = self.video_processor.preprocess(image, height=height, width=width).to(
+            device, dtype=torch.float32
+        )
+
+        with torch.no_grad():
+            latents_init, condition = self.prepare_latents(
+                image_tensor,
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                num_frames,
+                torch.float32,
+                device,
+                generator,
+                latents,
+            )
+
+        # ── Step 5.5: render_latent (target, no grad) ────────────────
+        with torch.no_grad():
+            render_latent = retrieve_latents(self.vae.encode(render_video), sample_mode="argmax")
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(render_latent.device, render_latent.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(render_latent.device, render_latent.dtype)
+            render_latent = (render_latent - latents_mean) * latents_std  # [B,C,F_lat,h,w]
+
+        # render_mask → latent space binary mask
+        render_mask_lat = self._downsample_mask_to_latent(
+            render_mask.to(device)
+        )  # [B, 1, F_lat, h, w] bool
+
+        # ── TTO setup ────────────────────────────────────────────────
+        latents = torch.nn.Parameter(latents_init)
+        optimizer = torch.optim.Adam([latents], lr=latent_lr)
+
+        # sigmas[i] is the flow-matching noise level at denoising step i
+        sigmas = self.scheduler.sigmas  # [T+1], float32 on device
+
+        # ── Step 6: denoising loop ───────────────────────────────────
+        self._num_timesteps = len(timesteps)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+                optimizer.zero_grad()
+
+                sigma_t = sigmas[i].to(dtype=torch.float32)
+
+                # Transformer forward — model weights do NOT need gradients
+                with torch.no_grad():
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(
+                        transformer_dtype
+                    )
+                    timestep = t.expand(latents.shape[0])
+
+                    v_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        render_latent=render_latent,
+                        render_mask=render_mask,
+                        camera_embedding=camera_embedding,
+                        timestep=timestep,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_hidden_states_image=image_embeds,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
+
+                    if self.do_classifier_free_guidance:
+                        v_uncond = self.transformer(
+                            hidden_states=latent_model_input,
+                            render_latent=render_latent,
+                            render_mask=render_mask,
+                            camera_embedding=camera_embedding,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            encoder_hidden_states_image=image_embeds,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        v_pred = v_uncond + guidance_scale * (v_pred - v_uncond)
+
+                    v_pred = v_pred.float()  # cast to float32 for numerics
+
+                # Flow-matching Tweedie:  x_0_hat = x_t - σ_t · v_pred
+                # Gradient flows back to `latents` (Parameter) through this formula.
+                x0_hat = latents - sigma_t * v_pred  # [B, C, F_lat, h, w]
+
+                # Loss at point-cloud mask positions (in latent space)
+                if render_mask_lat.any():
+                    mask_expanded = render_mask_lat.expand_as(x0_hat)
+                    pred_at_mask   = x0_hat[mask_expanded]
+                    target_at_mask = render_latent[mask_expanded].detach()
+
+                    pcd_loss = (
+                        F.l1_loss(pred_at_mask, target_at_mask)
+                        + F.mse_loss(pred_at_mask, target_at_mask)
+                    ) * pcd_guidance_scale
+                    pcd_loss.backward()
+
+                    # Gradient scaling: normalise by v_pred magnitude
+                    # (mirrors Marigold-DC's pred_epsilon rescaling)
+                    with torch.no_grad():
+                        v_norm = torch.linalg.norm(v_pred)
+                        g_norm = torch.linalg.norm(latents.grad)
+                        latents.grad.mul_(v_norm / g_norm.clamp(min=1e-8))
+
+                    optimizer.step()
+
+                # Regular denoising step (updates latent data, no grad)
+                with torch.no_grad():
+                    latents.data = self.scheduler.step(
+                        v_pred.to(transformer_dtype), t, latents, return_dict=False
+                    )[0]
+
+                    # Reset UniPC multi-step history so stale predictions
+                    # from before the optimizer step do not corrupt the trajectory.
+                    if hasattr(self.scheduler, "model_outputs"):
+                        self.scheduler.model_outputs = [
+                            None
+                        ] * self.scheduler.config.solver_order
+                        self.scheduler.lower_order_nums = 0
+
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        self._current_timestep = None
+
+        # ── Decode ───────────────────────────────────────────────────
+        if output_type != "latent":
+            with torch.no_grad():
+                out_latents = latents.detach().to(self.vae.dtype)
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(out_latents.device, out_latents.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(out_latents.device, out_latents.dtype)
+                out_latents = out_latents / latents_std + latents_mean
+                video = self.vae.decode(out_latents, return_dict=False)[0]
+                video = self.video_processor.postprocess_video(video, output_type=output_type)
+        else:
+            video = latents.detach()
+
         self.maybe_free_model_hooks()
 
         if not return_dict:

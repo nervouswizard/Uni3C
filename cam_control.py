@@ -39,6 +39,12 @@ if __name__ == '__main__':
     parser.add_argument("--negative_prompt", default="", type=str, help="Negative prompt to avoid unwanted content")
     parser.add_argument("--max_area", default=480 * 768, type=int, help="Total pixel area of height * width")
     parser.add_argument("--seed", default=1024, type=int, help="random seed")
+    parser.add_argument("--pcd_completion", action="store_true",
+                        help="Enable point-cloud completion (Marigold-DC style TTO at inference)")
+    parser.add_argument("--pcd_guidance_scale", default=1.0, type=float,
+                        help="Weight on the point-cloud latent loss (used with --pcd_completion)")
+    parser.add_argument("--latent_lr", default=0.02, type=float,
+                        help="Adam lr for latent optimisation (used with --pcd_completion)")
     args = parser.parse_args()
 
     rank = int(os.getenv("RANK", 0))
@@ -161,19 +167,30 @@ if __name__ == '__main__':
 
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed)
-    output = pipe(
+
+    call_fn = pipe.call_with_pcd_completion if args.pcd_completion else pipe
+    call_kwargs = dict(
         image=image,
         render_video=render_video.to(device),
         render_mask=render_mask.to(device),
         camera_embedding=camera_embedding.to(device),
-        prompt=(args.prompt),
+        prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         height=height,
         width=width,
         num_frames=args.nframe,
         guidance_scale=5.0,
         generator=gen,
-    ).frames[0]
+    )
+    if args.pcd_completion:
+        call_kwargs["pcd_guidance_scale"] = args.pcd_guidance_scale
+        call_kwargs["latent_lr"] = args.latent_lr
+        logger.info(
+            f"PCD completion enabled — pcd_guidance_scale={args.pcd_guidance_scale}, "
+            f"latent_lr={args.latent_lr}"
+        )
+
+    output = call_fn(**call_kwargs).frames[0]
 
     if is_main_process():
         export_to_video(output, args.output_path, fps=16)
