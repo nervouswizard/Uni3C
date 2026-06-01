@@ -4,7 +4,7 @@ set -e
 # ============================================================
 # PCD Completion 推論腳本
 #
-# 使用方式：
+# 使用方式（需先 conda activate sean-uni3c，或直接執行）：
 #   bash start_pcd_completion.sh [SUBJECT] [TRAJ] [GPU]
 #
 # 範例：
@@ -16,15 +16,19 @@ set -e
 #   Stage 2（本腳本）  ：bash start_pcd_completion.sh → 補洞補全推論
 # ============================================================
 
-SUBJECT="${1:-human}"        # 對象名稱（對應 data/tcp/input_image/ 與 outputs/tcp/）
-TRAJ="${2:-left}"            # 軌跡名稱（對應 Stage 1 的 --traj_type）
-GPU="${3:-2}"                # 使用的 GPU index
+SUBJECT="${1:-human}"
+TRAJ="${2:-left}"
+GPU="${3:-2}"
+
+# 使用 sean-uni3c 環境的 python（避免受 base 環境 huggingface-hub 版本影響）
+PYTHON="/home/tony/anaconda3/envs/sean-uni3c/bin/python"
 
 DATE="$(date +%Y%m%d_%H%M)"
+MMDD="$(date +%m%d)"
 
 REFERENCE_IMAGE="data/tcp/input_image/${SUBJECT}.png"
-RENDER_PATH="outputs/tcp/$(date +%m%d)/${SUBJECT}/${TRAJ}"
-OUTPUT_PATH="outputs/tcp/$(date +%m%d)/${SUBJECT}/${TRAJ}/result_pcd_completion_${DATE}.mp4"
+RENDER_PATH="outputs/tcp/${MMDD}/${SUBJECT}/${TRAJ}"
+OUTPUT_PATH="outputs/tcp/${MMDD}/${SUBJECT}/${TRAJ}/result_pcd_completion_${DATE}.mp4"
 
 # ── 若 png 不存在則試 jpg / jpeg ────────────────────────────
 if [ ! -f "$REFERENCE_IMAGE" ]; then
@@ -40,6 +44,7 @@ fi
 echo "[INFO] Subject      : $SUBJECT"
 echo "[INFO] Trajectory   : $TRAJ"
 echo "[INFO] GPU          : $GPU"
+echo "[INFO] Python       : $PYTHON"
 echo "[INFO] Reference    : $REFERENCE_IMAGE"
 echo "[INFO] Render path  : $RENDER_PATH"
 echo "[INFO] Output       : $OUTPUT_PATH"
@@ -66,7 +71,7 @@ export MALLOC_TRIM_THRESHOLD_=0
 # ── 模式 A：單 GPU + Sequential CPU Offload（最穩定）────────
 # pcd_guidance_scale : 點雲 loss 強度（建議 0.5~2.0，從 1.0 開始調）
 # latent_lr          : latent 優化的 learning rate（建議 0.01~0.05）
-CUDA_VISIBLE_DEVICES="$GPU" python cam_control.py \
+CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" cam_control.py \
     --reference_image "$REFERENCE_IMAGE" \
     --render_path     "$RENDER_PATH" \
     --output_path     "$OUTPUT_PATH" \
@@ -74,7 +79,7 @@ CUDA_VISIBLE_DEVICES="$GPU" python cam_control.py \
     --max_area        258048 \
     --sequential_offload \
     --pcd_completion \
-    --pcd_guidance_scale 1.0 \
+    --pcd_guidance_scale 0.1 \
     --latent_lr          0.02
 
 echo "[INFO] Done → $OUTPUT_PATH"

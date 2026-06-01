@@ -966,28 +966,31 @@ class PCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     v_pred = v_pred.float()  # cast to float32 for numerics
 
                 # Flow-matching Tweedie:  x_0_hat = x_t - σ_t · v_pred
-                # Gradient flows back to `latents` (Parameter) through this formula.
-                x0_hat = latents - sigma_t * v_pred  # [B, C, F_lat, h, w]
+                # torch.enable_grad() is required because sequential_offload and other
+                # pipeline hooks can silently wrap forward passes in no_grad contexts,
+                # which would break the gradient path from latents through x0_hat.
+                with torch.enable_grad():
+                    x0_hat = latents - sigma_t * v_pred.detach()  # [B, C, F_lat, h, w]
 
-                # Loss at point-cloud mask positions (in latent space)
-                if render_mask_lat.any():
-                    mask_expanded = render_mask_lat.expand_as(x0_hat)
-                    pred_at_mask   = x0_hat[mask_expanded]
-                    target_at_mask = render_latent[mask_expanded].detach()
+                    # Loss at point-cloud mask positions (in latent space)
+                    if render_mask_lat.any():
+                        mask_expanded = render_mask_lat.expand_as(x0_hat)
+                        pred_at_mask   = x0_hat[mask_expanded]
+                        target_at_mask = render_latent[mask_expanded].detach()
 
-                    pcd_loss = (
-                        F.l1_loss(pred_at_mask, target_at_mask)
-                        + F.mse_loss(pred_at_mask, target_at_mask)
-                    ) * pcd_guidance_scale
-                    pcd_loss.backward()
+                        pcd_loss = (
+                            F.l1_loss(pred_at_mask, target_at_mask)
+                            + F.mse_loss(pred_at_mask, target_at_mask)
+                        ) * pcd_guidance_scale
+                        pcd_loss.backward()
 
-                    # Gradient scaling: normalise by v_pred magnitude
-                    # (mirrors Marigold-DC's pred_epsilon rescaling)
+                # Gradient scaling: normalise by v_pred magnitude
+                # (mirrors Marigold-DC's pred_epsilon rescaling)
+                if latents.grad is not None:
                     with torch.no_grad():
                         v_norm = torch.linalg.norm(v_pred)
                         g_norm = torch.linalg.norm(latents.grad)
                         latents.grad.mul_(v_norm / g_norm.clamp(min=1e-8))
-
                     optimizer.step()
 
                 # Regular denoising step (updates latent data, no grad)
@@ -995,14 +998,6 @@ class PCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     latents.data = self.scheduler.step(
                         v_pred.to(transformer_dtype), t, latents, return_dict=False
                     )[0]
-
-                    # Reset UniPC multi-step history so stale predictions
-                    # from before the optimizer step do not corrupt the trajectory.
-                    if hasattr(self.scheduler, "model_outputs"):
-                        self.scheduler.model_outputs = [
-                            None
-                        ] * self.scheduler.config.solver_order
-                        self.scheduler.lower_order_nums = 0
 
                 if i == len(timesteps) - 1 or (
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
